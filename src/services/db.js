@@ -1,62 +1,166 @@
-import { openDB } from 'idb';
+import { supabase } from './supabase.js';
 
-const DB_NAME = 'finance-tracker-db';
-const DB_VERSION = 1;
-const STORE_NAME = 'transactions';
-
-async function initDB() {
-    return openDB(DB_NAME, DB_VERSION, {
-        upgrade(db) {
-            if (!db.objectStoreNames.contains(STORE_NAME)) {
-                const store = db.createObjectStore(STORE_NAME, {
-                    keyPath: 'id',
-                    autoIncrement: false
-                });
-                store.createIndex('date', 'date');
-                store.createIndex('createdAt', 'createdAt');
-            }
-        }
-    });
-}
-
-export async function addTransaction(transaction) {
-    const db = await initDB();
-    const tx = {
-        ...transaction,
-        id: transaction.id || Date.now().toString(),
-        createdAt: new Date().toISOString()
-    };
-    await db.add(STORE_NAME, tx);
-    return tx.id;
-}
-
-export async function updateTransaction(transaction) {
-    const db = await initDB();
-    await db.put(STORE_NAME, transaction);
-}
-
-export async function getTransactions() {
-    const db = await initDB();
-    const all = await db.getAllFromIndex(STORE_NAME, 'date');
-    // Sort descending by date
-    return all.sort((a, b) => new Date(b.date) - new Date(a.date));
-}
-
-export async function getTransaction(id) {
-    const db = await initDB();
-    return db.get(STORE_NAME, id);
-}
-
-export async function deleteTransaction(id) {
-    const db = await initDB();
-    await db.delete(STORE_NAME, id);
+/**
+ * Get the currently logged-in user's ID
+ */
+async function getCurrentUserId() {
+    const { data: { session } } = await supabase.auth.getSession();
+    if (!session) throw new Error('User not authenticated');
+    return session.user.id;
 }
 
 /**
- * Basic dashboard stats
+ * Add a new transaction along with its item details.
+ */
+export async function addTransaction(transaction) {
+    const userId = await getCurrentUserId();
+
+    // 1. Insert into expenses table
+    const { data: expenseData, error: expenseError } = await supabase
+        .from('expenses')
+        .insert([{
+            toko: transaction.store,
+            total: transaction.total,
+            date: transaction.date,
+            user_id: userId
+        }])
+        .select('id')
+        .single();
+
+    if (expenseError) {
+        console.error('Error adding expense:', expenseError);
+        throw expenseError;
+    }
+
+    const expenseId = expenseData.id;
+
+    // 2. Insert into detail_expenses table
+    if (transaction.items && transaction.items.length > 0) {
+        const detailItems = transaction.items.map(item => ({
+            expense_id: expenseId,
+            name: item.name,
+            qty: item.qty || 1,
+            price: item.price
+        }));
+
+        const { error: detailsError } = await supabase
+            .from('detail_expenses')
+            .insert(detailItems);
+
+        if (detailsError) {
+            console.error('Error adding detail items:', detailsError);
+            throw detailsError;
+        }
+    }
+
+    return expenseId;
+}
+
+/**
+ * Update an existing transaction (Currently only supports updating the header)
+ */
+export async function updateTransaction(transaction) {
+    // This is a simplified update that ONLY updates the main receipt info
+    // A robust app would also delete and re-insert the detail items
+    const { error } = await supabase
+        .from('expenses')
+        .update({
+            toko: transaction.store,
+            total: transaction.total,
+            date: transaction.date
+        })
+        .eq('id', transaction.id);
+
+    if (error) throw error;
+}
+
+/**
+ * Fetch all transactions for the current user, along with their detail items
+ */
+export async function getTransactions() {
+    const { data, error } = await supabase
+        .from('expenses')
+        .select(`
+            id,
+            toko,
+            total,
+            date,
+            created_at,
+            items:detail_expenses ( id, name, qty, price )
+        `)
+        .order('date', { ascending: false });
+
+    if (error) {
+        console.error('Error fetching transactions:', error);
+        throw error;
+    }
+
+    // Map DB schema back to the frontend expected schema
+    return data.map(dbRow => ({
+        id: dbRow.id,
+        store: dbRow.toko,
+        total: Number(dbRow.total),
+        date: dbRow.date,
+        createdAt: dbRow.created_at,
+        items: dbRow.items || []
+    }));
+}
+
+/**
+ * Get a specific transaction by ID
+ */
+export async function getTransaction(id) {
+    const { data, error } = await supabase
+        .from('expenses')
+        .select(`
+            id,
+            toko,
+            total,
+            date,
+            items:detail_expenses ( id, name, qty, price )
+        `)
+        .eq('id', id)
+        .single();
+
+    if (error) {
+        if (error.code === 'PGRST116') return null; // Not found
+        throw error;
+    }
+
+    return {
+        id: data.id,
+        store: data.toko,
+        total: Number(data.total),
+        date: data.date,
+        items: data.items || []
+    };
+}
+
+/**
+ * Delete a transaction structure (Deletes detail_expenses automatically due to ON DELETE CASCADE)
+ */
+export async function deleteTransaction(id) {
+    const { error } = await supabase
+        .from('expenses')
+        .delete()
+        .eq('id', id);
+
+    if (error) throw error;
+}
+
+/**
+ * Calculate dashboard stats directly from fetched transactions.
+ * (In a massive production app we would write a SQL RPC function to sum this on the backend)
  */
 export async function getStats() {
-    const transactions = await getTransactions();
+    let transactions = [];
+    try {
+        transactions = await getTransactions();
+    } catch (err) {
+        // Silently fail auth fetching on init
+        console.warn("Could not fetch stats yet (user likely not logged in).");
+        return { totalThisMonth: 0, totalOverall: 0, topStore: '-', transactionsCount: 0 };
+    }
 
     const now = new Date();
     const currentMonth = now.toISOString().substring(0, 7); // YYYY-MM
@@ -71,11 +175,9 @@ export async function getStats() {
             totalThisMonth += tx.total;
         }
 
-        // Store stats
         storeCounts[tx.store] = (storeCounts[tx.store] || 0) + 1;
     });
 
-    // Top store
     let topStore = 'Belum ada';
     let maxCount = 0;
     for (const store in storeCounts) {
